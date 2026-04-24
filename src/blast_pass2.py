@@ -1,27 +1,50 @@
 """
-blast_pass2.py — BLAST-based pass-2 classification for HMM-unclassified sequences.
+blast_pass2.py — MMseqs2-based pass-2 classification for HMM-unclassified
+sequences.
 
-Sequences not classified by HMM search are BLASTed against classified sequences.
-If a strong similarity match exists (80-80-80 rule by default), the unclassified
-sequence inherits the classification of its best BLAST hit.
+Ported from TEBinSorter's original blastn-based pass-2 to mmseqs2, following
+the edits on github.com/cwb14/TEsorter branch `my-new-idea2` (head b398509).
+The filename, public symbols (`blast_pass2`, `store_blast_hits`,
+`classify_from_blast`), and the SQLite `blast_hits` table are retained to keep
+the rest of the pipeline (pipeline.py, tesorter_compat.py, classifier.py,
+results.py) unchanged. mmseqs bits/fident/qcov are remapped to the BLAST-
+shaped columns at insert time:
 
-Key design:
-  - Cross-database: one BLAST search against all classified sequences from all databases
-  - Per-database reconstruction via filtering on classified_by
-  - Parallel chunked BLAST with greedy bin-packing by sequence length
-  - All results stored in SQLite for post-hoc threshold adjustment
+    pident   = fident * 100      (0..100)
+    qcovs    = qcov   * 100      (0..100)
+    length   = alnlen
+    bitscore = bits
+    evalue   = 0.0               (sentinel; unread downstream)
+    slen     = 0                 (sentinel; unread downstream)
+
+Sequences unclassified by HMM are searched against the classified pool with
+a single multithreaded mmseqs2 easy-search (no chunking; mmseqs is internally
+parallel). Split alignments are merged per (query, target) pair within a
+500 bp gap window before best-hit selection.
 """
 
 import logging
 import os
-import subprocess
 import tempfile
 import time
 from collections import defaultdict
 
 import pyfastx
 
+import mmseqs
+import pass2_external
+
 log = logging.getLogger(__name__)
+
+
+# Developer toggle, deliberately not exposed on the CLI.
+#   True  -> require BOTH qcov AND tcov >= coverage threshold (strict).
+#   False -> require AT LEAST ONE of qcov, tcov >= coverage threshold
+#            (Wicker et al. 80-80-80 style: "candidate must cover ≥80% of
+#            at least one of the elements being compared").
+# mmseqs2 has no native "at-least-one" cov-mode, so either way this is
+# enforced post-hoc in classify_from_blast's SQL WHERE clause.
+REQUIRE_BOTH_COVERAGE = False
 
 
 def _get_classified_ids(conn):
@@ -32,7 +55,6 @@ def _get_classified_ids(conn):
     """
     classified = defaultdict(set)
 
-    # Check which tables exist
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
@@ -46,122 +68,111 @@ def _get_classified_ids(conn):
 
 
 def split_classified_unclassified(input_fasta, classified_ids, outdir,
-                                  n_chunks=4, seq_type="nucl"):
-    """Split input into classified (BLAST db) and chunked unclassified (queries).
+                                  seq_type="nucl"):
+    """Split input into classified-pool FASTA and unclassified-query FASTA.
 
-    One pass through the input. Unclassified sequences are bin-packed into
-    n_chunks files by total sequence length for even BLAST parallelism.
-
-    Args:
-        input_fasta: path to input FASTA
-        classified_ids: {seq_name: set(databases)}
-        outdir: directory for output files
-        n_chunks: number of query chunks
-        seq_type: "nucl" or "prot" (determines which sequences to write)
-
-    Returns:
-        db_fasta: path to classified sequences FASTA (BLAST database)
-        query_chunks: list of paths to unclassified sequence chunks
-        db_seq_to_dbs: {seq_name: set(databases)} for DB sequences
+    One pass through the input. When seq_type=="nucl", sequences written to
+    the DB FASTA are uppercased and stripped of non-ATCG characters (mmseqs
+    doesn't tolerate ambiguous bases as cleanly as blastn).
     """
     os.makedirs(outdir, exist_ok=True)
 
     db_fasta = os.path.join(outdir, "blast_db.fa")
-    chunk_paths = [os.path.join(outdir, f"blast_query_{i}.fa") for i in range(n_chunks)]
+    qry_fasta = os.path.join(outdir, "blast_query.fa")
 
-    # Open all handles
-    db_handle = open(db_fasta, "w")
-    chunk_handles = [open(p, "w") for p in chunk_paths]
-    chunk_lengths = [0] * n_chunks
-
+    nucl = (seq_type == "nucl")
     fa = pyfastx.Fasta(input_fasta, build_index=True)
+
     n_classified = 0
     n_unclassified = 0
     db_seq_to_dbs = {}
 
-    for rec in fa:
-        name = rec.name
-        seq = str(rec.seq)
+    with open(db_fasta, "w") as dbh, open(qry_fasta, "w") as qh:
+        for rec in fa:
+            name = rec.name
+            seq = str(rec.seq)
+            if nucl:
+                seq = "".join(c for c in seq.upper() if c in "ATCG")
 
-        if name in classified_ids:
-            db_handle.write(f">{name}\n{seq}\n")
-            db_seq_to_dbs[name] = classified_ids[name]
-            n_classified += 1
-        else:
-            # Bin-pack into lightest chunk
-            min_idx = chunk_lengths.index(min(chunk_lengths))
-            chunk_handles[min_idx].write(f">{name}\n{seq}\n")
-            chunk_lengths[min_idx] += len(seq)
-            n_unclassified += 1
-
-    db_handle.close()
-    for h in chunk_handles:
-        h.close()
-
-    # Remove empty chunks
-    query_chunks = [p for p in chunk_paths if os.path.getsize(p) > 0]
+            if name in classified_ids:
+                dbh.write(f">{name}\n{seq}\n")
+                db_seq_to_dbs[name] = classified_ids[name]
+                n_classified += 1
+            else:
+                qh.write(f">{name}\n{seq}\n")
+                n_unclassified += 1
 
     log.info(f"  Split: {n_classified} classified (DB), "
-             f"{n_unclassified} unclassified -> {len(query_chunks)} chunks")
+             f"{n_unclassified} unclassified (query)")
 
-    return db_fasta, query_chunks, db_seq_to_dbs
-
-
-def make_blast_db(db_fasta, seq_type="nucl"):
-    """Run makeblastdb."""
-    dbtype = seq_type
-    cmd = f"makeblastdb -in {db_fasta} -dbtype {dbtype} -out {db_fasta}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.error(f"makeblastdb failed: {result.stderr}")
-        raise RuntimeError(f"makeblastdb failed: {result.stderr}")
-    log.info(f"  BLAST database built: {db_fasta}")
+    return db_fasta, qry_fasta, db_seq_to_dbs
 
 
-def run_blast_chunk(query_chunk, db_fasta, output, seq_type="nucl", ncpu=1):
-    """Run BLAST on one query chunk."""
-    app = "blastn" if seq_type == "nucl" else "blastp"
-    outfmt = "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen qcovs qcovhsp sstrand"
-    cmd = (f"{app} -query {query_chunk} -db {db_fasta} -out {output} "
-           f"-outfmt '{outfmt}' -num_threads {ncpu}")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.warning(f"BLAST chunk failed: {result.stderr[:200]}")
-    return output
+def run_mmseqs(query_fa, db_fa, m8_out, tmpdir,
+               seqtype="nucl", ncpu=4,
+               min_identity=80, min_coverage=80, min_length=80,
+               cov_mode=0, sensitivity=None):
+    """Run a single mmseqs2 easy-search.
+
+    The thresholds (identity/coverage/length) are NOT passed as search-side
+    filters. mmseqs2's prefilter + --cov-mode 0 + --min-seq-id interacts
+    destructively on nucleotide data: hits that clearly pass the final
+    thresholds post-alignment get dropped before they are scored. This mirrors
+    TEBinSorter's blastn pass-2, which also runs unfiltered at search time and
+    applies the 80-80-80 rule post-hoc. The final filter is enforced by
+    classify_from_blast's SQL WHERE on the percent-scaled columns.
+
+    cov_mode is still passed through — it shapes the geometric coverage
+    definition mmseqs uses for `qcov`, which we then compare against the
+    --pass2-rule coverage threshold in SQL.
+    """
+    mmseqs.mmseqs_easy_search(
+        db_seq=db_fa,
+        qry_seq=query_fa,
+        out_m8=m8_out,
+        tmpdir=tmpdir,
+        seqtype=seqtype,
+        ncpu=ncpu,
+        min_seq_id=0.0,
+        min_cov=0.0,
+        cov_mode=cov_mode,
+        min_aln_len=0,
+        sensitivity=sensitivity,
+    )
+    return m8_out
 
 
-def parse_blast_output(blast_out):
-    """Parse BLAST outfmt 6 into hit dicts."""
-    fields = ["qseqid", "sseqid", "pident", "length", "mismatch", "gapopen",
-              "qstart", "qend", "sstart", "send", "evalue", "bitscore",
-              "qlen", "slen", "qcovs", "qcovhsp", "sstrand"]
-    types = [str, str, float, int, int, int, int, int, int, int,
-             float, float, int, int, float, float, str]
+def parse_mmseqs_output(m8_path):
+    """Parse mmseqs2 M8, merge split alignments, return hit-dicts shaped for
+    store_blast_hits. Percent columns (pident, qcovs, tcovs) are on 0-100;
+    evalue is sentinel 0.0 because mmseqs's M8 format doesn't carry it and no
+    downstream reader consumes it."""
+    best = mmseqs.parse_mmseqs_m8_besthit(m8_path)
 
     hits = []
-    if not os.path.exists(blast_out):
-        return hits
-
-    with open(blast_out) as f:
-        for line in f:
-            vals = line.strip().split("\t")
-            if len(vals) < len(fields):
-                continue
-            hit = {}
-            for field, typ, val in zip(fields, types, vals):
-                hit[field] = typ(val)
-            hits.append(hit)
-
+    for qid, rc in best.items():
+        hits.append({
+            "qseqid": rc.qseqid,
+            "sseqid": rc.sseqid,
+            "pident": rc.fident * 100.0,
+            "length": rc.alnlen,
+            "evalue": 0.0,
+            "bitscore": rc.bits,
+            "qlen": rc.qlen,
+            "slen": rc.tlen,
+            "qcovs": rc.qcov * 100.0,
+            "tcovs": rc.tcov * 100.0,
+        })
     return hits
 
 
 def store_blast_hits(conn, hits, db_seq_to_dbs):
-    """Store BLAST hits in SQLite.
+    """Store hits in SQLite blast_hits table.
 
-    Adds classified_by field indicating which databases classified
-    each target sequence.
+    Adds a tcovs column so the pass-2 filter can enforce target-side coverage.
+    classified_by records which databases flagged the target. For sequences
+    that came from --pass2-classified-fasta, db_seq_to_dbs contains {"external"}.
     """
-    # Indexes on blast_hits are built by results.finalize_db at end of run.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS blast_hits (
             qseqid      TEXT NOT NULL,
@@ -173,6 +184,7 @@ def store_blast_hits(conn, hits, db_seq_to_dbs):
             qlen        INTEGER NOT NULL,
             slen        INTEGER NOT NULL,
             qcovs       REAL NOT NULL,
+            tcovs       REAL NOT NULL,
             classified_by TEXT NOT NULL
         )
     """)
@@ -184,69 +196,66 @@ def store_blast_hits(conn, hits, db_seq_to_dbs):
         rows.append((
             h["qseqid"], h["sseqid"], h["pident"], h["length"],
             h["evalue"], h["bitscore"], h["qlen"], h["slen"],
-            h["qcovs"], classified_by,
+            h["qcovs"], h["tcovs"], classified_by,
         ))
 
     conn.executemany(
-        "INSERT INTO blast_hits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO blast_hits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     conn.commit()
-    log.info(f"  Stored {len(rows)} BLAST hits")
+    log.info(f"  Stored {len(rows)} mmseqs hits")
 
 
 def classify_from_blast(conn, classifications, database=None,
                         min_identity=80, min_coverage=80, min_length=80):
-    """Classify unclassified sequences from BLAST hits.
+    """Classify unclassified sequences from stored pass-2 hits.
 
-    Args:
-        conn: sqlite3 connection with blast_hits table
-        classifications: dict of {seq_id: {order, superfamily, ...}} from
-                         classifier.classify_sequences()
-        database: if set, only accept BLAST targets classified by this database
-        min_identity: minimum percent identity
-        min_coverage: minimum query coverage
-        min_length: minimum alignment length
-
-    Returns:
-        list of classification dicts for newly classified sequences
+    Filter requires pident ≥ min_identity, qcovs ≥ min_coverage,
+    tcovs ≥ min_coverage, length ≥ min_length. (min_coverage is applied to
+    BOTH query and target coverage.) Best hit per query is selected by
+    bitscore. Targets inherit Order + Superfamily; Clade is set to 'unknown'.
     """
-    # Check table exists
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "blast_hits" not in tables:
         return []
 
-    # Build filter
-    where = "WHERE pident >= ? AND qcovs >= ? AND length >= ?"
-    params = [min_identity, min_coverage, min_length]
+    if REQUIRE_BOTH_COVERAGE:
+        where = ("WHERE pident >= ? AND qcovs >= ? AND tcovs >= ? "
+                 "AND length >= ?")
+        params = [min_identity, min_coverage, min_coverage, min_length]
+    else:
+        # At-least-one-side coverage (Wicker et al. 80-80-80 interpretation)
+        where = ("WHERE pident >= ? AND (qcovs >= ? OR tcovs >= ?) "
+                 "AND length >= ?")
+        params = [min_identity, min_coverage, min_coverage, min_length]
+    log.info(f"  coverage mode: {'BOTH' if REQUIRE_BOTH_COVERAGE else 'AT-LEAST-ONE'} "
+             f"qcov/tcov >= {min_coverage}")
 
     if database:
         where += " AND classified_by LIKE ?"
         params.append(f"%{database}%")
 
-    # Best hit per query by bitscore
     rows = conn.execute(f"""
-        SELECT qseqid, sseqid, pident, qcovs, length, bitscore
+        SELECT qseqid, sseqid, pident, qcovs, tcovs, length, bitscore
         FROM blast_hits
         {where}
         ORDER BY bitscore DESC
     """, params).fetchall()
 
-    # Classified ID set for quick lookup
     classified_set = set(classifications.keys())
 
     best = {}
-    for qid, sid, pident, qcovs, length, bitscore in rows:
+    for qid, sid, pident, qcovs, tcovs, length, bitscore in rows:
         if qid in classified_set:
-            continue  # already classified by HMM, skip
+            continue
         if qid not in best:
-            best[qid] = (sid, pident, qcovs, length, bitscore)
+            best[qid] = (sid, pident, qcovs, tcovs, length, bitscore)
 
-    # Inherit classification from best hit's target
     new_classifications = []
     no_source = 0
-    for qid, (sid, pident, qcovs, length, bitscore) in best.items():
+    for qid, (sid, pident, qcovs, tcovs, length, bitscore) in best.items():
         if sid in classifications:
             source = classifications[sid]
             new_classifications.append({
@@ -260,15 +269,16 @@ def classify_from_blast(conn, classifications, database=None,
                 "blast_source": sid,
                 "blast_pident": pident,
                 "blast_qcovs": qcovs,
+                "blast_tcovs": tcovs,
                 "blast_bitscore": bitscore,
             })
         else:
             no_source += 1
 
     if no_source:
-        log.info(f"    {no_source} BLAST hits to unclassified targets (skipped)")
+        log.info(f"    {no_source} pass-2 hits to unclassified targets (skipped)")
 
-    log.info(f"  BLAST pass-2: {len(new_classifications)} sequences classified "
+    log.info(f"  pass-2: {len(new_classifications)} sequences classified "
              f"(from {len(best)} hits passing filters)")
     return new_classifications
 
@@ -276,94 +286,103 @@ def classify_from_blast(conn, classifications, database=None,
 def blast_pass2(input_fasta, conn, hmm_classifications=None,
                 seq_type="nucl", n_processors=4,
                 min_identity=80, min_coverage=80, min_length=80,
-                outdir=None):
-    """Full BLAST pass-2 pipeline.
+                outdir=None,
+                pass2_classified_fasta=None,
+                sensitivity=None,
+                cov_mode=0):
+    """mmseqs2-based pass-2 pipeline.
 
     Args:
         input_fasta: path to input FASTA
         conn: sqlite3 connection with HMM results
         hmm_classifications: dict of {seq_id: {order, superfamily, clade, ...}}
-                             from classifier.classify_sequences(). Targets inherit
-                             classification from their best BLAST match.
-        seq_type: "nucl" or "prot"
-        n_processors: number of parallel BLAST processes
-        min_identity: filter threshold
-        min_coverage: filter threshold
-        min_length: filter threshold
-        outdir: output directory (default: tempdir)
+                             from classifier.classify_sequences(). Mutated in
+                             place if pass2_classified_fasta is supplied.
+        seq_type: "nucl" (mmseqs --search-type 3) or "prot" (--search-type 1)
+        n_processors: mmseqs --threads
+        min_identity/min_coverage/min_length: percent thresholds (0-100, 0-100, bp)
+        outdir: output directory; a subdirectory `mmseqs_pass2/` is created inside
+        pass2_classified_fasta: optional FASTA of prior classifications to
+                                augment the pass-2 target pool
+        sensitivity: optional mmseqs -s value
+        cov_mode: mmseqs --cov-mode (0=query, 1=target, 2=shorter). Default 0.
 
     Returns:
-        list of new classification dicts
+        list of new classification dicts for sequences rescued by pass-2.
     """
     t0 = time.time()
+    mmseqs.check_mmseqs()
 
-    # Get classified IDs from database
     classified_ids = _get_classified_ids(conn)
     if not classified_ids:
-        log.info("  No classified sequences for BLAST pass-2")
+        log.info("  No classified sequences for mmseqs pass-2")
         return []
 
-    log.info(f"  BLAST pass-2: {len(classified_ids)} classified sequences as targets")
+    log.info(f"  mmseqs pass-2: {len(classified_ids)} classified sequences as targets")
 
-    # Split
     if outdir is None:
-        outdir = tempfile.mkdtemp(prefix="tebinsorter_blast_")
+        outdir = tempfile.mkdtemp(prefix="tebinsorter_mmseqs_")
+    work = os.path.join(outdir, "mmseqs_pass2")
 
-    blast_dir = os.path.join(outdir, "blast_pass2")
-    db_fasta, query_chunks, db_seq_to_dbs = split_classified_unclassified(
-        input_fasta, classified_ids, blast_dir, n_chunks=n_processors,
-        seq_type=seq_type)
+    db_fasta, qry_fasta, db_seq_to_dbs = split_classified_unclassified(
+        input_fasta, classified_ids, work, seq_type=seq_type)
 
-    if not query_chunks:
+    if os.path.getsize(qry_fasta) == 0:
         log.info("  No unclassified sequences to search")
         return []
 
-    # Build BLAST database
-    make_blast_db(db_fasta, seq_type=seq_type)
+    if hmm_classifications is None:
+        hmm_classifications = {}
 
-    # Run parallel BLAST
-    log.info(f"  Running {len(query_chunks)} BLAST processes")
+    if pass2_classified_fasta:
+        updated = pass2_external.update_classified_fasta_headers(
+            pass2_classified_fasta, hmm_classifications, work
+        )
+        src = updated or pass2_classified_fasta
+        pass2_external.extend_hmm_classifications_from_fasta(
+            hmm_classifications, src, db_seq_to_dbs
+        )
+        merged_db = os.path.join(work, "pass2_db_merged.fa")
+        pass2_external.merge_classified_fastas(
+            merged_db, db_fasta, src, clean_nucl=(seq_type == "nucl")
+        )
+        db_fasta = merged_db
+
+    if os.path.getsize(db_fasta) == 0:
+        log.info("  pass-2 target FASTA is empty; skipping mmseqs")
+        return []
+
+    m8_out = os.path.join(work, "pass2.m8")
+    tmpdir = os.path.join(work, "mmseqs_tmp")
+
+    log.info(f"  Running mmseqs easy-search with {n_processors} threads")
     t1 = time.time()
-
-    import multiprocessing
-    blast_outputs = []
-    args_list = []
-    for i, chunk in enumerate(query_chunks):
-        out = chunk + ".blastout"
-        blast_outputs.append(out)
-        args_list.append((chunk, db_fasta, out, seq_type, 1))
-
-    with multiprocessing.Pool(n_processors) as pool:
-        pool.starmap(run_blast_chunk, args_list)
-
+    run_mmseqs(
+        qry_fasta, db_fasta, m8_out, tmpdir,
+        seqtype=seq_type, ncpu=n_processors,
+        min_identity=min_identity, min_coverage=min_coverage,
+        min_length=min_length,
+        cov_mode=cov_mode, sensitivity=sensitivity,
+    )
     t2 = time.time()
-    log.info(f"  BLAST search: {t2 - t1:.1f}s")
+    log.info(f"  mmseqs search: {t2 - t1:.1f}s")
 
-    # Parse and store
-    all_hits = []
-    for blast_out in blast_outputs:
-        all_hits.extend(parse_blast_output(blast_out))
+    hits = parse_mmseqs_output(m8_out)
+    log.info(f"  {len(hits)} mmseqs best-hit records after split-alignment merge")
 
-    log.info(f"  {len(all_hits)} total BLAST hits")
+    if hits:
+        store_blast_hits(conn, hits, db_seq_to_dbs)
 
-    if all_hits:
-        store_blast_hits(conn, all_hits, db_seq_to_dbs)
+    log.info(f"  {len(hmm_classifications)} HMM classifications available for inheritance")
 
-    # Build HMM classifications lookup for inheritance
-    hmm_cls = {}
-    if hmm_classifications is not None:
-        hmm_cls = hmm_classifications
-    log.info(f"  {len(hmm_cls)} HMM classifications available for inheritance")
-
-    # Classify
     new_cls = classify_from_blast(
-        conn, hmm_cls,
+        conn, hmm_classifications,
         min_identity=min_identity,
         min_coverage=min_coverage,
         min_length=min_length,
     )
 
     t3 = time.time()
-    log.info(f"  BLAST pass-2 total: {t3 - t0:.1f}s")
+    log.info(f"  mmseqs pass-2 total: {t3 - t0:.1f}s")
 
     return new_cls

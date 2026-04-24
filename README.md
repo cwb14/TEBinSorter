@@ -1,3 +1,58 @@
+# TEBinSorter_mmseqs
+
+Fork of TEBinSorter with pass-2 similarity search migrated from `blastn` to
+[mmseqs2](https://github.com/soedinglab/MMseqs2). The HMM-based pass-1
+(the source of the 500× speedup) is untouched.
+
+These mmseqs edits are ported line-by-line from the `my-new-idea2` branch of
+[github.com/cwb14/TEsorter](https://github.com/cwb14/TEsorter) — originally
+applied against upstream TEsorter, now re-applied here so they sit on top of
+TEBinSorter's faster HMM core.
+
+## Additional runtime dependency
+
+`mmseqs` binary must be on `$PATH`. Install with conda:
+
+```
+mamba install -c bioconda mmseqs2
+```
+
+Everything else is unchanged from TEBinSorter (pyhmmer, pyfastx, numpy).
+
+## New / renamed CLI options
+
+| Option | Default | Purpose |
+|---|---|---|
+| `-dp2`, `--disable-pass2` | off | Skip the mmseqs2 pass-2 (HMM-only classification) |
+| `-rule`, `--pass2-rule I-C-L` | `80-80-80` | Pass-2 threshold as identity-coverage-length (percent-percent-bp) |
+| `--pass2-classified-fasta FASTA` | none | Optional FASTA of prior classifications to augment the pass-2 target pool. Headers must be shaped `>id#Order/Superfamily/Clade` |
+| `--mmseqs-sensitivity S` | mmseqs2 default | Passed through as `mmseqs -s` |
+| `--mmseqs-cov-mode {0,1,2}` | `0` (query coverage) | Passed through as `mmseqs --cov-mode` |
+
+## What changed vs stock TEBinSorter
+
+- `src/blast_pass2.py` — internals swapped from `blastn`+`makeblastdb` to
+  `mmseqs easy-search`. Dropped the `multiprocessing.Pool` chunking layer
+  (mmseqs is natively multithreaded via `--threads`). The SQLite `blast_hits`
+  schema and the public symbols (`blast_pass2`, `store_blast_hits`,
+  `classify_from_blast`) are retained so no downstream consumer (pipeline.py,
+  tesorter_compat.py, classifier.py, results.py) needs to change. mmseqs
+  bits / fident / qcov are remapped to the BLAST-shaped columns at insert
+  time; `evalue` and `slen` columns hold sentinel zeros (unread downstream).
+- `src/mmseqs.py` — new. Wrapper around `mmseqs easy-search`, split-alignment
+  merger (`_MAX_SPLIT_GAP = 500`), M8 parser, best-hit selector.
+- `src/pass2_external.py` — new. Helpers for `--pass2-classified-fasta`:
+  header parsing, classification-dict merging, coordinate-based header
+  upgrade, FASTA merging with dedup + ATCG cleaning.
+- `src/pipeline.py` / `src/tesorter_compat.py` — wire the five new CLI args
+  through the pass-2 call.
+
+---
+
+Original TEBinSorter README follows.
+
+---
+
 # TEBinSorter
 
 Near-perfect replication of [TEsorter](https://github.com/zhangrengang/TEsorter) at greatly improved speed. 

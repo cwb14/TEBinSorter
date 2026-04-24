@@ -2,7 +2,7 @@
 Main pipeline for TE classification.
 
 Orchestrates: FASTA ingestion -> alphabet detection -> optional translation
--> HMM search -> classification -> BLAST pass-2 -> SQLite + TSV output.
+-> HMM search -> classification -> mmseqs2 pass-2 -> SQLite + TSV output.
 """
 
 import argparse
@@ -24,6 +24,7 @@ from classifier import (classify_sequences, export_classification_tsv,
                        store_classifications, reconcile_classifications,
                        DB_CONFIGS)
 from blast_pass2 import blast_pass2
+from mmseqs import mmseqs_version
 
 logging.basicConfig(
     level=logging.INFO,
@@ -149,6 +150,38 @@ def parse_args():
              "per-database classifications and their summed normalized "
              "scores in descending order of evidence strength.",
     )
+
+    # mmseqs2 pass-2 options
+    parser.add_argument(
+        "-dp2", "--disable-pass2",
+        action="store_true", default=False,
+        help="Skip pass-2 similarity search (HMM-only classification)",
+    )
+    parser.add_argument(
+        "-rule", "--pass2-rule",
+        default="80-80-80", type=str, metavar="I-C-L",
+        help="Pass-2 threshold as identity-coverage-length "
+             "(percent-percent-bp) [default: %(default)s]",
+    )
+    parser.add_argument(
+        "--pass2-classified-fasta",
+        default=None, type=str, metavar="FASTA",
+        help="Optional FASTA of previously-classified elements to augment "
+             "the pass-2 target database. Headers must be like "
+             ">id#Order/Superfamily/Clade",
+    )
+    parser.add_argument(
+        "--mmseqs-sensitivity",
+        default=None, type=float, metavar="S",
+        help="mmseqs2 -s sensitivity [default: mmseqs2's own default]",
+    )
+    parser.add_argument(
+        "--mmseqs-cov-mode",
+        default=0, type=int, choices=[0, 1, 2],
+        help="mmseqs2 --cov-mode (0=query, 1=target, 2=shorter) "
+             "[default: %(default)s]",
+    )
+
     return parser.parse_args()
 
 
@@ -416,16 +449,35 @@ def main():
     log.info(f"  Reconciled across {len(per_db_results)} databases: "
              f"{len(reconciled)} sequences")
 
-    # --- BLAST pass-2 ---
+    # --- mmseqs2 pass-2 ---
     all_results = list(reconciled)
-    if not args.pass_1_only and all_classifications:
-        log.info("--- BLAST pass-2 ---")
+    if (not args.pass_1_only and not args.disable_pass2
+            and all_classifications):
+        try:
+            p2_id, p2_cov, p2_len = args.pass2_rule.split("-")
+            p2_id = float(p2_id)
+            p2_cov = float(p2_cov)
+            p2_len = float(p2_len)
+        except ValueError:
+            raise SystemExit(
+                f"--pass2-rule must be I-C-L (three numbers separated by '-'), "
+                f"got {args.pass2_rule!r}"
+            )
+
+        log.info("--- mmseqs2 pass-2 ---")
+        mmseqs_version()
         blast_cls = blast_pass2(
             args.sequence, conn,
             hmm_classifications=all_classifications,
             seq_type="nucl",
             n_processors=args.processors,
+            min_identity=p2_id,
+            min_coverage=p2_cov,
+            min_length=p2_len,
             outdir=outdir,
+            pass2_classified_fasta=args.pass2_classified_fasta,
+            sensitivity=args.mmseqs_sensitivity,
+            cov_mode=args.mmseqs_cov_mode,
         )
 
         if blast_cls:

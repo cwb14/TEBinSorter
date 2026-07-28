@@ -1,13 +1,13 @@
-# TEBinSorter_mmseqs
+# TEsorter2_mmseqs
 
-Fork of TEBinSorter with pass-2 similarity search migrated from `blastn` to
+Fork of TEsorter2 with pass-2 similarity search migrated from `blastn` to
 [mmseqs2](https://github.com/soedinglab/MMseqs2). The HMM-based pass-1
 (the source of the 500× speedup) is untouched.
 
 These mmseqs edits are ported line-by-line from the `my-new-idea2` branch of
 [github.com/cwb14/TEsorter](https://github.com/cwb14/TEsorter) — originally
 applied against upstream TEsorter, now re-applied here so they sit on top of
-TEBinSorter's faster HMM core.
+TEsorter2's faster HMM core.
 
 ## Additional runtime dependency
 
@@ -17,7 +17,7 @@ TEBinSorter's faster HMM core.
 mamba install -c bioconda mmseqs2
 ```
 
-Everything else is unchanged from TEBinSorter (pyhmmer, pyfastx, numpy).
+Everything else is unchanged from TEsorter2 (pyhmmer, pyfastx, numpy).
 
 ## New / renamed CLI options
 
@@ -29,7 +29,7 @@ Everything else is unchanged from TEBinSorter (pyhmmer, pyfastx, numpy).
 | `--mmseqs-sensitivity S` | mmseqs2 default | Passed through as `mmseqs -s` |
 | `--mmseqs-cov-mode {0,1,2}` | `0` (query coverage) | Passed through as `mmseqs --cov-mode` |
 
-## What changed vs stock TEBinSorter
+## What changed vs stock TEsorter2
 
 - `tesorter2/blast_pass2.py` — internals swapped from `blastn`+`makeblastdb` to
   `mmseqs easy-search`. Dropped the `multiprocessing.Pool` chunking layer

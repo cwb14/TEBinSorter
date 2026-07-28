@@ -2,7 +2,7 @@
 blast_pass2.py — MMseqs2-based pass-2 classification for HMM-unclassified
 sequences.
 
-Ported from TEBinSorter's original blastn-based pass-2 to mmseqs2, following
+Ported from TEsorter2's original blastn-based pass-2 to mmseqs2, following
 the edits on github.com/cwb14/TEsorter branch `my-new-idea2` (head b398509).
 The filename, public symbols (`blast_pass2`, `store_blast_hits`,
 `classify_from_blast`), and the SQLite `blast_hits` table are retained to keep
@@ -118,7 +118,7 @@ def run_mmseqs(query_fa, db_fa, m8_out, tmpdir,
     filters. mmseqs2's prefilter + --cov-mode 0 + --min-seq-id interacts
     destructively on nucleotide data: hits that clearly pass the final
     thresholds post-alignment get dropped before they are scored. This mirrors
-    TEBinSorter's blastn pass-2, which also runs unfiltered at search time and
+    TEsorter2's blastn pass-2, which also runs unfiltered at search time and
     applies the 80-80-80 rule post-hoc. The final filter is enforced by
     classify_from_blast's SQL WHERE on the percent-scaled columns.
 

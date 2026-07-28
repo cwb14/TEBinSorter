@@ -31,8 +31,8 @@ from collections import defaultdict
 
 import pyfastx
 
-import mmseqs
-import pass2_external
+from . import mmseqs
+from . import pass2_external
 
 log = logging.getLogger(__name__)
 
@@ -321,7 +321,7 @@ def blast_pass2(input_fasta, conn, hmm_classifications=None,
     log.info(f"  mmseqs pass-2: {len(classified_ids)} classified sequences as targets")
 
     if outdir is None:
-        outdir = tempfile.mkdtemp(prefix="tebinsorter_mmseqs_")
+        outdir = tempfile.mkdtemp(prefix="tesorter2_mmseqs_")
     work = os.path.join(outdir, "mmseqs_pass2")
 
     db_fasta, qry_fasta, db_seq_to_dbs = split_classified_unclassified(
